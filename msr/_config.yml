@@ -1,0 +1,2 @@
+# Bỏ qua Jekyll build trên GitHub Pages để phục vụ trực tiếp file tĩnh
+include: [".*"]
