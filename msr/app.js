@@ -1,23 +1,32 @@
 /**
  * Mikoyan MSR Tool — Client Web App (GitHub Static / Direct Web)
  * Tự động đồng bộ trạng thái cày điểm và cảnh báo khởi động lại Modem.
+ * Hỗ trợ cả mạng nội bộ Wi-Fi và phát sóng Cloud Relay API để xem từ xa qua 4G.
  */
 
-// Lấy Base API URL (Hỗ trợ cấu hình tùy chỉnh qua localStorage)
+const DEFAULT_RELAY_TOPIC = "mikoyan_msr_live_1Yk7Rb";
+let lastWaitingState = false;
+let isPolling = false;
+let eventSource = null;
+
+// Lấy Base API URL
 function getApiBaseUrl() {
     const customUrl = localStorage.getItem("msr_bridge_url");
     if (customUrl && customUrl.trim()) {
         return customUrl.trim().replace(/\/+$/, "");
     }
-    // Nếu trang đang chạy tại subpath /msr (ví dụ: https://mikoyan.dpdns.org/msr)
-    if (window.location.pathname.startsWith("/msr")) {
-        return "/msr";
+    // Nếu chạy cục bộ trên máy tính hoặc cùng Wi-Fi
+    const host = window.location.hostname;
+    const isLocal = host === "localhost" ||
+                    host === "127.0.0.1" ||
+                    host.startsWith("192.168.") ||
+                    host.startsWith("10.") ||
+                    host.startsWith("172.");
+    if (isLocal) {
+        return window.location.pathname.startsWith("/msr") ? "/msr" : "";
     }
-    return "";
+    return null; // Chạy trên GitHub Pages hoặc domain ngoài -> dùng Cloud Relay API tự động
 }
-
-let lastWaitingState = false;
-let isPolling = false;
 
 // Âm thanh chuông báo khi cần đổi IP (Web Audio API)
 function playChime() {
@@ -39,8 +48,59 @@ function playChime() {
     }
 }
 
-// Lấy trạng thái thời gian thực từ Backend
-async function fetchStatus() {
+// Khởi chạy lắng nghe qua Cloud Relay API (để xem từ xa qua 4G/Internet)
+function initCloudRelay() {
+    const topic = localStorage.getItem("msr_relay_topic") || DEFAULT_RELAY_TOPIC;
+
+    // 1. Lấy ngay trạng thái mới nhất từ cache
+    fetch(`https://ntfy.sh/${topic}/json?poll=1&limit=1`)
+        .then(res => res.text())
+        .then(text => {
+            const lines = text.trim().split("\n").filter(l => l.trim());
+            for (const line of lines) {
+                try {
+                    const ev = JSON.parse(line);
+                    if (ev.event === "message" && ev.message) {
+                        const data = JSON.parse(ev.message);
+                        renderUI(data);
+                    }
+                } catch (e) {}
+            }
+        })
+        .catch(() => {});
+
+    // 2. Mở kết nối SSE thời gian thực (Server-Sent Events)
+    if (eventSource) {
+        eventSource.close();
+    }
+    try {
+        eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+        eventSource.onopen = () => {
+            const pcPill = document.getElementById("pcStatusPill");
+            const pcText = document.getElementById("pcStatusText");
+            pcPill.className = "pc-pill online";
+            pcText.textContent = "Cloud Live";
+            document.getElementById("latencyText").textContent = "Cloud Relay (Thời gian thực)";
+        };
+        eventSource.onmessage = (e) => {
+            try {
+                const ev = JSON.parse(e.data);
+                if (ev.event === "message" && ev.message) {
+                    const data = JSON.parse(ev.message);
+                    renderUI(data);
+                }
+            } catch (err) {}
+        };
+        eventSource.onerror = () => {
+            handleConnectionError();
+        };
+    } catch (err) {
+        console.warn("EventSource error:", err);
+    }
+}
+
+// Lấy trạng thái thời gian thực từ Backend nội bộ
+async function fetchStatusLocal() {
     if (isPolling) return;
     isPolling = true;
 
@@ -76,17 +136,19 @@ function handleConnectionError() {
         pcText.textContent = "Modem rebooting...";
     } else {
         pcPill.className = "pc-pill offline";
-        pcText.textContent = "Mất kết nối PC";
+        pcText.textContent = "Chờ kết nối...";
     }
-    latencyText.textContent = "Mất kết nối";
+    latencyText.textContent = "Đang kết nối lại...";
 }
 
 // Hiển thị dữ liệu lên giao diện
 function renderUI(data) {
+    if (!data) return;
+
     // 1. Trạng thái kết nối PC
     const pcPill = document.getElementById("pcStatusPill");
     const pcText = document.getElementById("pcStatusText");
-    if (data.pc_connected) {
+    if (data.pc_connected || eventSource) {
         pcPill.className = "pc-pill online";
         pcText.textContent = "PC Online";
     } else if (data.waiting_ip_change) {
@@ -204,18 +266,19 @@ function renderUI(data) {
     }
 }
 
-// Gửi hành động điều khiển về Backend
+// Gửi hành động điều khiển về Backend (khi có bridge trực tiếp)
 async function postAction(actionName) {
     const baseUrl = getApiBaseUrl();
-    const endpoint = (baseUrl ? baseUrl : "") + "/api/action";
+    if (!baseUrl) return; // Cloud relay là chế độ xem thuần túy
 
+    const endpoint = (baseUrl ? baseUrl : "") + "/api/action";
     try {
         await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ action: actionName })
         });
-        fetchStatus();
+        fetchStatusLocal();
     } catch (err) {
         console.error("Lỗi gửi action:", err);
     }
@@ -241,16 +304,44 @@ function saveSettings() {
         localStorage.removeItem("msr_bridge_url");
     }
     closeSettingsModal();
-    fetchStatus();
+    startSync();
 }
 
 function resetSettings() {
     localStorage.removeItem("msr_bridge_url");
     document.getElementById("bridgeUrlInput").value = "";
     closeSettingsModal();
-    fetchStatus();
+    startSync();
 }
 
-// Khởi chạy vòng lặp cập nhật mỗi 1.5 giây
-fetchStatus();
-setInterval(fetchStatus, 1500);
+// Bắt đầu luồng đồng bộ thông minh
+function startSync() {
+    const baseUrl = getApiBaseUrl();
+    if (baseUrl !== null) {
+        // Có địa chỉ nội bộ Wi-Fi hoặc bridge tùy chỉnh
+        fetchStatusLocal();
+        setInterval(fetchStatusLocal, 1500);
+    } else {
+        // Tự động chuyển sang Cloud Relay API xem từ xa qua 4G (Zero-Config)
+        initCloudRelay();
+        // Polling dự phòng mỗi 4 giây phòng khi mạng di động chập chờn
+        setInterval(() => {
+            const topic = localStorage.getItem("msr_relay_topic") || DEFAULT_RELAY_TOPIC;
+            fetch(`https://ntfy.sh/${topic}/json?poll=1&limit=1`)
+                .then(r => r.text())
+                .then(t => {
+                    const lines = t.trim().split("\n").filter(l => l.trim());
+                    for (const l of lines) {
+                        try {
+                            const ev = JSON.parse(l);
+                            if (ev.event === "message" && ev.message) {
+                                renderUI(JSON.parse(ev.message));
+                            }
+                        } catch (e) {}
+                    }
+                }).catch(() => {});
+        }, 4000);
+    }
+}
+
+startSync();
