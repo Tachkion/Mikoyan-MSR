@@ -11,23 +11,85 @@ let isPolling = false;
 let eventSource = null;
 let lastHeartbeatTime = 0; // Thời điểm nhận được bản tin gần nhất từ PC (giây)
 
-// Lấy Base API URL
+// Lấy Base API URL (Tự động nạp từ URL param, localStorage hoặc bridge.js)
 function getApiBaseUrl() {
+    // 1. Tự động kiểm tra và nạp Bridge từ URL (?bridge=... hoặc #bridge=... hoặc ?tunnel=...)
+    try {
+        const urlParams = new URLSearchParams(window.location.search);
+        let paramBridge = urlParams.get("bridge") || urlParams.get("tunnel");
+        if (!paramBridge && window.location.hash) {
+            const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, "?"));
+            paramBridge = hashParams.get("bridge") || hashParams.get("tunnel");
+        }
+        if (paramBridge && paramBridge.trim()) {
+            paramBridge = paramBridge.trim().replace(/\/+$/, "");
+            if (paramBridge.startsWith("http://") || paramBridge.startsWith("https://")) {
+                localStorage.setItem("msr_bridge_url", paramBridge);
+                // Làm sạch URL trên trình duyệt để ẩn tham số dài dòng
+                try {
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                } catch (e) {}
+                console.log("[Bridge Auto] ✔ Đã tự động kết nối và lưu Bridge từ URL:", paramBridge);
+                showAutoBridgeToast(paramBridge);
+                return paramBridge;
+            }
+        }
+    } catch (e) {}
+
+    // 2. Kiểm tra Bridge đã lưu trong bộ nhớ máy (localStorage)
     const customUrl = localStorage.getItem("msr_bridge_url");
     if (customUrl && customUrl.trim()) {
         return customUrl.trim().replace(/\/+$/, "");
     }
-    // Nếu chạy cục bộ trên máy tính hoặc cùng Wi-Fi
+
+    // 3. Kiểm tra Bridge mặc định từ bridge.js (nếu được xuất bản cùng web)
+    if (window.MSR_DEFAULT_BRIDGE_URL && window.MSR_DEFAULT_BRIDGE_URL.trim()) {
+        const defaultUrl = window.MSR_DEFAULT_BRIDGE_URL.trim().replace(/\/+$/, "");
+        if (defaultUrl.startsWith("http://") || defaultUrl.startsWith("https://")) {
+            return defaultUrl;
+        }
+    }
+
+    // 4. Nếu chạy cục bộ trên máy tính, cùng Wi-Fi hoặc qua Cloudflare Tunnel trực tiếp
     const host = window.location.hostname;
-    const isLocal = host === "localhost" ||
+    const isDirect = host === "localhost" ||
                     host === "127.0.0.1" ||
                     host.startsWith("192.168.") ||
                     host.startsWith("10.") ||
-                    host.startsWith("172.");
-    if (isLocal) {
+                    host.startsWith("172.") ||
+                    host.endsWith("trycloudflare.com") ||
+                    host.endsWith("cfargotunnel.com");
+    if (isDirect) {
         return window.location.pathname.startsWith("/msr") ? "/msr" : "";
     }
     return null; // Chạy trên GitHub Pages hoặc domain ngoài -> dùng Cloud Relay API tự động
+}
+
+// Thông báo Toast nhỏ khi Bridge được tự động cấu hình
+function showAutoBridgeToast(bridgeUrl) {
+    try {
+        const toast = document.createElement("div");
+        toast.style.position = "fixed";
+        toast.style.top = "16px";
+        toast.style.left = "50%";
+        toast.style.transform = "translateX(-50%)";
+        toast.style.background = "#15803d";
+        toast.style.color = "#ffffff";
+        toast.style.padding = "8px 16px";
+        toast.style.borderRadius = "20px";
+        toast.style.fontSize = "12px";
+        toast.style.fontWeight = "600";
+        toast.style.zIndex = "9999";
+        toast.style.boxShadow = "0 4px 14px rgba(0,0,0,0.4)";
+        toast.style.textAlign = "center";
+        toast.innerHTML = "✔ Đã tự động kết nối Bridge với Tool PC!";
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            toast.style.transition = "opacity 0.6s";
+            toast.style.opacity = "0";
+            setTimeout(() => toast.remove(), 600);
+        }, 3000);
+    } catch (e) {}
 }
 
 // Âm thanh chuông báo khi cần đổi IP (Web Audio API)
@@ -89,15 +151,22 @@ function setPcOfflineUI(reason) {
     const badge = document.getElementById("statusBadge");
 
     if (pcPill) pcPill.className = "pc-pill offline";
-    if (pcText) pcText.textContent = "PC Chưa Bật";
+    if (pcText) pcText.textContent = "Chưa kết nối PC";
     if (badge) {
         badge.className = "status-badge done";
-        badge.textContent = "CHƯA BẬT TOOL";
+        badge.textContent = "CHỜ KẾT NỐI";
     }
     const heroTitle = document.getElementById("heroTitle");
     const heroSubtitle = document.getElementById("heroSubtitle");
-    if (heroTitle) heroTitle.textContent = "Tool trên máy tính chưa mở";
-    if (heroSubtitle) heroSubtitle.textContent = reason || "Vui lòng mở START_TOOL.bat trên máy tính để kết nối";
+    if (heroTitle) heroTitle.textContent = "Chưa nhận được dữ liệu từ Tool PC";
+    if (heroSubtitle) {
+        const isExternal = !getApiBaseUrl();
+        if (isExternal) {
+            heroSubtitle.innerHTML = "Website đang mở ngoài mạng PC. Hãy bấm <a href='javascript:void(0)' onclick='openSettingsModal()' style='color:#38bdf8;text-decoration:underline;'>⚙️ Cài đặt Bridge</a> bên dưới để dán link Cloudflare Tunnel, hoặc mở trực tiếp link Tunnel trên điện thoại!";
+        } else {
+            heroSubtitle.textContent = reason || "Vui lòng mở START_TOOL.bat trên máy tính để kết nối";
+        }
+    }
     const currentIp = document.getElementById("currentIpText");
     if (currentIp) currentIp.textContent = "Chờ bật tool...";
     const latency = document.getElementById("latencyText");
@@ -274,11 +343,18 @@ function renderUI(data) {
         let html = "";
         data.accounts.forEach(acc => {
             const isFarming = String(acc.profile_id) === String(data.current_profile_id);
+            const isDolphinOpen = (data.dolphin_running_ids && data.dolphin_running_ids.indexOf(String(acc.profile_id)) !== -1);
             let badgeClass = "badge-ready";
             let stText = acc.status || "Ready";
+            let rowClass = "";
             if (isFarming) {
                 badgeClass = "badge-running";
                 stText = "Đang cày";
+                rowClass = "running";
+            } else if (isDolphinOpen) {
+                badgeClass = "badge-dolphin";
+                stText = "Đang mở";
+                rowClass = "dolphin-open";
             } else if (acc.status === "Done") {
                 badgeClass = "badge-done";
                 stText = "Xong";
@@ -290,7 +366,7 @@ function renderUI(data) {
                 stText = "Sẵn sàng";
             }
             html += `
-                <div class="account-item ${isFarming ? 'running' : ''}">
+                <div class="account-item ${rowClass}">
                     <div class="acc-info">
                         <div class="acc-name">${acc.profile_name || 'Profile'}</div>
                         <div class="acc-meta">Điểm: ${(Number(acc.current_points)||0).toLocaleString()} pts • Hôm nay: +${acc.gained_today||0}</div>
