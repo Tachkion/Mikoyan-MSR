@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Mikoyan MSR — Mobile Monitor</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Thanh tiêu đề Top Bar -->
+        <header class="top-bar">
+            <div class="brand-box">
+                <div class="brand-title">
+                    MIKOYAN MSR
+                    <span class="brand-badge">MONITOR</span>
+                </div>
+                <div class="brand-sub">Mobile Remote Controller</div>
+            </div>
+            <div class="header-status-box">
+                <div class="pc-pill offline" id="pcStatusPill">
+                    <span class="dot-indicator"></span>
+                    <span id="pcStatusText">PC Chưa Bật</span>
+                </div>
+                <div class="ip-pill">
+                    <span id="currentIpText">Chờ bật tool...</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Thẻ Hero Banner: Trạng thái & Điều khiển chính -->
+        <main class="hero-banner" id="heroBanner">
+            <div class="hero-header">
+                <div class="status-badge done" id="statusBadge">CHƯA BẬT TOOL</div>
+                <div class="timer-badge" id="timerBadge">--:--</div>
+            </div>
+            <div class="hero-title" id="heroTitle">Tool trên máy tính chưa mở</div>
+            <div class="hero-subtitle" id="heroSubtitle">Vui lòng khởi chạy START_TOOL.bat trên máy tính để kết nối</div>
+
+            <!-- Hộp Cảnh Báo Khởi Động Lại Modem (Hiện khi cần đổi IP) -->
+            <div class="ip-alert-box" id="ipAlertBox">
+                <div class="ip-alert-title">
+                    ⚠️ YÊU CẦU: KHỞI ĐỘNG LẠI MODEM ĐỂ ĐỔI IP
+                </div>
+                <div class="ip-compare">
+                    <span class="ip-label">IP tài khoản trước:</span>
+                    <span class="ip-val" id="alertOldIp">--</span>
+                </div>
+                <div class="ip-compare">
+                    <span class="ip-label">IP hiện tại phát hiện:</span>
+                    <span class="ip-val" id="alertCurrentIp">Đang dò IP mới...</span>
+                </div>
+                <div class="btn-row" style="margin-top:6px;">
+                    <button class="btn btn-amber" onclick="postAction('check_ip')">🔄 Kiểm tra IP ngay</button>
+                    <button class="btn btn-dark" onclick="postAction('skip_ip')">⏭️ Bỏ qua đổi IP</button>
+                </div>
+            </div>
+
+            <!-- Thanh tiến độ -->
+            <div class="progress-wrapper">
+                <div class="progress-meta">
+                    <span id="progressText">Tiến độ: 0 / 0 (0%)</span>
+                    <span id="progressPercent">0%</span>
+                </div>
+                <div class="progress-bar-bg">
+                    <div class="progress-bar-fill" id="progressBarFill"></div>
+                </div>
+            </div>
+
+            <!-- Nút điều khiển -->
+            <div class="btn-row" id="mainControls">
+                <button class="btn btn-green" id="startBtn" onclick="postAction('start_all')">▶ Bắt đầu cày tất cả</button>
+                <button class="btn btn-red" id="stopBtn" style="display:none;" onclick="postAction('stop')">⏹ Dừng lại</button>
+            </div>
+        </main>
+
+        <!-- Danh sách tài khoản -->
+        <section class="section-card">
+            <div class="section-header">
+                <span>Tiến trình các tài khoản</span>
+                <span id="accCountHeader">0 tài khoản</span>
+            </div>
+            <div class="accounts-list" id="accountsList">
+                <div class="loading-placeholder">Đang tải danh sách tài khoản...</div>
+            </div>
+        </section>
+
+        <!-- Nhật ký Console Log thời gian thực -->
+        <section class="section-card">
+            <div class="section-header">
+                <span>Nhật ký thời gian thực</span>
+                <div class="header-actions">
+                    <span class="action-link" onclick="postAction('clear_logs')">Xóa log</span>
+                </div>
+            </div>
+            <div class="logs-terminal" id="logsTerminal">Đang kết nối backend...</div>
+        </section>
+
+        <!-- Cài đặt kết nối & Chân trang -->
+        <footer class="footer-info">
+            <div class="footer-links">
+                <span class="settings-trigger" onclick="openSettingsModal()">⚙️ Cài đặt kết nối Bridge</span>
+                <span>•</span>
+                <span id="latencyText">Độ trễ: -- ms</span>
+            </div>
+            <div class="footer-credits">Mikoyan MSR Mobile Monitor • Tự động đổi IP Modem</div>
+        </footer>
+    </div>
+
+    <!-- Modal Cài đặt Bridge API (Dành cho ai deploy GitHub Pages trỏ về PC) -->
+    <div class="modal-overlay" id="settingsModal" onclick="closeSettingsModal(event)">
+        <div class="modal-card" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3>Cấu hình Endpoint Bridge</h3>
+                <span class="modal-close" onclick="closeSettingsModal()">&times;</span>
+            </div>
+            <div class="modal-body">
+                <p class="modal-desc">
+                    Nếu bạn mở web qua GitHub Pages độc lập, hãy nhập URL của Backend máy tính (ví dụ qua Cloudflare Tunnel hoặc IP công khai):
+                </p>
+                <label class="modal-label" for="bridgeUrlInput">URL Máy Tính / Tunnel:</label>
+                <input type="text" id="bridgeUrlInput" class="modal-input" placeholder="Để trống để tự động nhận diện">
+                <div class="modal-actions">
+                    <button class="btn btn-green" onclick="saveSettings()">Lưu cấu hình</button>
+                    <button class="btn btn-dark" onclick="resetSettings()">Mặc định (Auto)</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="bridge.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
