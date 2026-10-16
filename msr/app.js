@@ -1,7 +1,7 @@
 /**
  * Mikoyan MSR Tool — Client Web App (GitHub Static / Direct Web)
  * Tự động đồng bộ trạng thái cày điểm và cảnh báo khởi động lại Modem.
- * Hỗ trợ cả mạng nội bộ Wi-Fi và phát sóng Cloud Relay API để xem từ xa qua 4G.
+ * Hỗ trợ song song cả mạng nội bộ Wi-Fi/Tunnel lẫn Cloud Relay API (ntfy) để xem từ xa tức thì qua 4G.
  */
 
 const DEFAULT_RELAY_TOPIC = "mikoyan_msr_live_1Yk7Rb";
@@ -9,7 +9,60 @@ const DEFAULT_CMD_TOPIC = "mikoyan_msr_cmds_1Yk7Rb";
 let lastWaitingState = false;
 let isPolling = false;
 let eventSource = null;
-let lastHeartbeatTime = 0; // Thời điểm nhận được bản tin gần nhất từ PC (giây)
+let lastHeartbeatTime = 0; // Thời điểm nhận được bản tin gần nhất từ PC (giây timestamp client)
+let localFailCount = 0;
+let localPollingTimer = null;
+
+// Tự động nhận diện và cập nhật Bridge URL mới nhất trực tiếp từ GitHub API (0 giây cache)
+async function autoFetchBridgeFromGitHub() {
+    try {
+        const ghApi = "https://api.github.com/repos/Tachkion/Mikoyan-MSR/contents/msr/bridge.json?t=" + Date.now();
+        const res = await fetch(ghApi, { cache: "no-store" });
+        if (res.ok) {
+            const data = await res.json();
+            if (data.content) {
+                const decoded = JSON.parse(atob(data.content.replace(/\s/g, "")));
+                if (decoded.bridge_url && decoded.bridge_url.startsWith("https://")) {
+                    const currentSaved = localStorage.getItem("msr_bridge_url");
+                    if (currentSaved !== decoded.bridge_url) {
+                        console.log("[Auto-Bridge GitHub API] ✔ Nhận diện Bridge mới nhất:", decoded.bridge_url);
+                        localStorage.setItem("msr_bridge_url", decoded.bridge_url);
+                        localFailCount = 0;
+                    }
+                    return decoded.bridge_url;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn("[Auto-Bridge] Lỗi đọc GitHub API:", e);
+    }
+
+    try {
+        const rawUrl = "https://raw.githubusercontent.com/Tachkion/Mikoyan-MSR/main/msr/bridge.json?t=" + Date.now();
+        const r2 = await fetch(rawUrl, { cache: "no-store" });
+        if (r2.ok) {
+            const d2 = await r2.json();
+            if (d2.bridge_url && d2.bridge_url.startsWith("https://")) {
+                localStorage.setItem("msr_bridge_url", d2.bridge_url);
+                return d2.bridge_url;
+            }
+        }
+    } catch (e) {}
+
+    try {
+        const localPath = (window.location.pathname.startsWith("/msr") ? "/msr" : "") + "/bridge.json?t=" + Date.now();
+        const r3 = await fetch(localPath, { cache: "no-store" });
+        if (r3.ok) {
+            const d3 = await r3.json();
+            if (d3.bridge_url && d3.bridge_url.startsWith("https://")) {
+                localStorage.setItem("msr_bridge_url", d3.bridge_url);
+                return d3.bridge_url;
+            }
+        }
+    } catch (e) {}
+
+    return null;
+}
 
 // Lấy Base API URL (Tự động nạp từ URL param, localStorage hoặc bridge.js)
 function getApiBaseUrl() {
@@ -23,9 +76,9 @@ function getApiBaseUrl() {
         }
         if (paramBridge && paramBridge.trim()) {
             paramBridge = paramBridge.trim().replace(/\/+$/, "");
-            if (paramBridge.startsWith("http://") || paramBridge.startsWith("https://")) {
+            if ((paramBridge.startsWith("http://") || paramBridge.startsWith("https://")) && !paramBridge.includes("example.trycloudflare.com")) {
                 localStorage.setItem("msr_bridge_url", paramBridge);
-                // Làm sạch URL trên trình duyệt để ẩn tham số dài dòng
+                localFailCount = 0;
                 try {
                     window.history.replaceState({}, document.title, window.location.pathname);
                 } catch (e) {}
@@ -38,12 +91,12 @@ function getApiBaseUrl() {
 
     // 2. Kiểm tra Bridge đã lưu trong bộ nhớ máy (localStorage)
     const customUrl = localStorage.getItem("msr_bridge_url");
-    if (customUrl && customUrl.trim()) {
+    if (customUrl && customUrl.trim() && !customUrl.includes("example.trycloudflare.com")) {
         return customUrl.trim().replace(/\/+$/, "");
     }
 
     // 3. Kiểm tra Bridge mặc định từ bridge.js (nếu được xuất bản cùng web)
-    if (window.MSR_DEFAULT_BRIDGE_URL && window.MSR_DEFAULT_BRIDGE_URL.trim()) {
+    if (window.MSR_DEFAULT_BRIDGE_URL && window.MSR_DEFAULT_BRIDGE_URL.trim() && !window.MSR_DEFAULT_BRIDGE_URL.includes("example.trycloudflare.com")) {
         const defaultUrl = window.MSR_DEFAULT_BRIDGE_URL.trim().replace(/\/+$/, "");
         if (defaultUrl.startsWith("http://") || defaultUrl.startsWith("https://")) {
             return defaultUrl;
@@ -62,7 +115,7 @@ function getApiBaseUrl() {
     if (isDirect) {
         return window.location.pathname.startsWith("/msr") ? "/msr" : "";
     }
-    return null; // Chạy trên GitHub Pages hoặc domain ngoài -> dùng Cloud Relay API tự động
+    return null;
 }
 
 // Thông báo Toast nhỏ khi Bridge được tự động cấu hình
@@ -118,30 +171,32 @@ function initCloudRelay() {
 
     // 1. Mở kết nối SSE thời gian thực (Server-Sent Events)
     if (eventSource) {
-        eventSource.close();
+        try { eventSource.close(); } catch (e) {}
     }
     try {
         eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
         eventSource.onopen = () => {
-            document.getElementById("latencyText").textContent = "Cloud Live (Đang dò tín hiệu PC...)";
+            console.log("[Cloud Relay] Đã mở luồng SSE thời gian thực:", topic);
+            const latency = document.getElementById("latencyText");
+            if (latency) latency.textContent = "Cloud Live (Đang kết nối PC...)";
         };
         eventSource.onmessage = (e) => {
             try {
                 const ev = JSON.parse(e.data);
                 if (ev.event === "message" && ev.message) {
                     const data = JSON.parse(ev.message);
-                    renderUI(data);
+                    renderUI(data, "sse");
                 }
             } catch (err) {}
         };
         eventSource.onerror = () => {
-            handleConnectionError();
+            console.warn("[Cloud Relay] SSE mất tín hiệu, đang chờ tự động kết nối lại...");
         };
     } catch (err) {
         console.warn("EventSource error:", err);
     }
 
-    // 2. Poll kiểm tra dữ liệu hiện tại
+    // 2. Poll kiểm tra dữ liệu hiện tại ngay khi vừa vào trang
     pollLatestCloudMessage();
 }
 
@@ -162,7 +217,7 @@ function setPcOfflineUI(reason) {
     if (heroSubtitle) {
         const isExternal = !getApiBaseUrl();
         if (isExternal) {
-            heroSubtitle.innerHTML = "Website đang mở ngoài mạng PC. Hãy bấm <a href='javascript:void(0)' onclick='openSettingsModal()' style='color:#38bdf8;text-decoration:underline;'>⚙️ Cài đặt Bridge</a> bên dưới để dán link Cloudflare Tunnel, hoặc mở trực tiếp link Tunnel trên điện thoại!";
+            heroSubtitle.innerHTML = "Website đang mở ngoài mạng PC. Hãy mở START_TOOL.bat trên máy tính để tự động phát sóng trực tiếp, hoặc nhấn <a href='javascript:void(0)' onclick='openSettingsModal()' style='color:#38bdf8;text-decoration:underline;'>⚙️ Cài đặt Bridge</a> để kiểm tra.";
         } else {
             heroSubtitle.textContent = reason || "Vui lòng mở START_TOOL.bat trên máy tính để kết nối";
         }
@@ -200,7 +255,7 @@ function pollLatestCloudMessage() {
                 } catch (e) {}
             }
             if (latestData) {
-                renderUI(latestData);
+                renderUI(latestData, "cloud_poll");
             } else if (lastHeartbeatTime === 0) {
                 setPcOfflineUI();
             }
@@ -213,22 +268,29 @@ function pollLatestCloudMessage() {
 // Lấy trạng thái thời gian thực từ Backend nội bộ
 async function fetchStatusLocal() {
     if (isPolling) return;
-    isPolling = true;
-
-    const startTime = performance.now();
     const baseUrl = getApiBaseUrl();
-    const endpoint = (baseUrl ? baseUrl : "") + "/api/status";
+    if (!baseUrl) return;
+
+    isPolling = true;
+    const startTime = performance.now();
+    const endpoint = baseUrl + "/api/status";
 
     try {
-        const res = await fetch(endpoint);
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 3500);
+        const res = await fetch(endpoint, { signal: controller.signal });
+        clearTimeout(timeoutId);
+
         if (!res.ok) {
             handleConnectionError();
             return;
         }
         const data = await res.json();
+        localFailCount = 0;
         const latency = Math.round(performance.now() - startTime);
-        document.getElementById("latencyText").textContent = `Độ trễ: ${latency} ms`;
-        renderUI(data);
+        const latencyEl = document.getElementById("latencyText");
+        if (latencyEl) latencyEl.textContent = `Độ trễ: ${latency} ms`;
+        renderUI(data, "local");
     } catch (err) {
         handleConnectionError();
     } finally {
@@ -238,6 +300,7 @@ async function fetchStatusLocal() {
 
 // Xử lý khi mất kết nối tới Backend (ví dụ khi modem đang reboot hoặc PC tắt)
 function handleConnectionError() {
+    localFailCount++;
     if (lastWaitingState) {
         const pcPill = document.getElementById("pcStatusPill");
         const pcText = document.getElementById("pcStatusText");
@@ -246,39 +309,71 @@ function handleConnectionError() {
         if (pcText) pcText.textContent = "Modem rebooting...";
         if (latencyText) latencyText.textContent = "Đang khởi động lại modem...";
     } else {
-        setPcOfflineUI();
+        // Tự động kiểm tra lại GitHub API xem Tool có cập nhật URL mới không
+        if (localFailCount >= 2) {
+            autoFetchBridgeFromGitHub().then(newUrl => {
+                if (newUrl) {
+                    localFailCount = 0;
+                    if (!localPollingTimer) {
+                        localPollingTimer = setInterval(fetchStatusLocal, 1500);
+                    }
+                }
+            });
+        }
+        // Nếu địa chỉ Bridge tùy chỉnh thất bại liên tiếp 4 lần, tự xóa để quét lại
+        if (localFailCount >= 4) {
+            const savedBridge = localStorage.getItem("msr_bridge_url");
+            if (savedBridge) {
+                console.warn("[Bridge] Bridge tùy chỉnh không phản hồi 4 lần. Tự động gỡ bỏ:", savedBridge);
+                localStorage.removeItem("msr_bridge_url");
+            }
+        }
+        if (lastHeartbeatTime === 0 || (Date.now() / 1000 - lastHeartbeatTime > 15)) {
+            setPcOfflineUI();
+        }
     }
 }
 
 // Hiển thị dữ liệu lên giao diện
-function renderUI(data) {
+function renderUI(data, source = "cloud") {
     if (!data) return;
 
     const nowSec = Date.now() / 1000;
-    // Kiểm tra tính mới của dữ liệu: Phải có timestamp và trong vòng 15 giây
-    const hasFreshTimestamp = data.timestamp && (Math.abs(nowSec - data.timestamp) < 15);
-    const isLocal = getApiBaseUrl() !== null;
-    const isOnline = isLocal ? Boolean(data.pc_connected || true) : hasFreshTimestamp;
+    // SSE & Local fetch là sự kiện trực tiếp thời gian thực, luôn hợp lệ
+    // Với poll từ cloud buffer, chấp nhận dữ liệu trong vòng 300 giây để phòng lệch đồng hồ hệ thống
+    let isFresh = true;
+    if (source === "cloud_poll" && data.timestamp) {
+        if (Math.abs(nowSec - data.timestamp) > 300) {
+            isFresh = false;
+        }
+    }
 
     const pcPill = document.getElementById("pcStatusPill");
     const pcText = document.getElementById("pcStatusText");
     const banner = document.getElementById("heroBanner");
     const badge = document.getElementById("statusBadge");
 
-    if (isOnline) {
+    if (isFresh) {
         lastHeartbeatTime = nowSec;
-        pcPill.className = "pc-pill online";
-        pcText.textContent = "PC Online";
+        if (pcPill) pcPill.className = "pc-pill online";
+        if (pcText) pcText.textContent = "PC Online";
     } else {
         setPcOfflineUI("Dữ liệu cũ đã hết hạn. Chờ máy tính phát tín hiệu mới...");
         return;
     }
 
     // 2. IP & Tiêu đề
-    document.getElementById("currentIpText").textContent = data.current_ip || "Không có IP";
-    document.getElementById("timerBadge").textContent = data.elapsed_time || "00:00";
-    document.getElementById("heroTitle").textContent = data.status_title || "Hệ thống sẵn sàng";
-    document.getElementById("heroSubtitle").textContent = data.status_subtitle || "";
+    const curIpEl = document.getElementById("currentIpText");
+    if (curIpEl) curIpEl.textContent = data.current_ip || "Không có IP";
+
+    const timerBadge = document.getElementById("timerBadge");
+    if (timerBadge) timerBadge.textContent = data.elapsed_time || "00:00";
+
+    const heroTitle = document.getElementById("heroTitle");
+    if (heroTitle) heroTitle.textContent = data.status_title || "Hệ thống sẵn sàng";
+
+    const heroSub = document.getElementById("heroSubtitle");
+    if (heroSub) heroSub.textContent = data.status_subtitle || "";
 
     // 3. Khối Banner Hero & Hộp Cảnh Báo Khởi Động Lại Modem
     const fill = document.getElementById("progressBarFill");
@@ -287,21 +382,25 @@ function renderUI(data) {
     const stopBtn = document.getElementById("stopBtn");
 
     if (data.is_running) {
-        startBtn.style.display = "none";
-        stopBtn.style.display = "flex";
+        if (startBtn) startBtn.style.display = "none";
+        if (stopBtn) stopBtn.style.display = "flex";
     } else {
-        startBtn.style.display = "flex";
-        stopBtn.style.display = "none";
+        if (startBtn) startBtn.style.display = "flex";
+        if (stopBtn) stopBtn.style.display = "none";
     }
 
     if (data.waiting_ip_change) {
-        banner.className = "hero-banner waiting-ip";
-        badge.className = "status-badge waiting";
-        badge.textContent = "CHỜ ĐỔI IP";
-        fill.className = "progress-bar-fill farming";
-        ipAlert.classList.add("active");
-        document.getElementById("alertOldIp").textContent = data.old_ip || "--";
-        document.getElementById("alertCurrentIp").textContent = data.current_ip || "Đang kiểm tra...";
+        if (banner) banner.className = "hero-banner waiting-ip";
+        if (badge) {
+            badge.className = "status-badge waiting";
+            badge.textContent = "CHỜ ĐỔI IP";
+        }
+        if (fill) fill.className = "progress-bar-fill farming";
+        if (ipAlert) ipAlert.classList.add("active");
+        const alertOld = document.getElementById("alertOldIp");
+        if (alertOld) alertOld.textContent = data.old_ip || "--";
+        const alertCur = document.getElementById("alertCurrentIp");
+        if (alertCur) alertCur.textContent = data.current_ip || "Đang kiểm tra...";
 
         // Chuông báo & Rung điện thoại lần đầu khi chuyển trạng thái
         if (!lastWaitingState) {
@@ -311,35 +410,40 @@ function renderUI(data) {
             }
         }
     } else {
-        banner.className = "hero-banner";
-        ipAlert.classList.remove("active");
+        if (banner) banner.className = "hero-banner";
+        if (ipAlert) ipAlert.classList.remove("active");
 
-        if (data.status_mode === "farming") {
-            badge.className = "status-badge farming";
-            badge.textContent = "ĐANG CÀY";
-            fill.className = "progress-bar-fill farming";
-        } else if (data.status_mode === "done") {
-            badge.className = "status-badge done";
-            badge.textContent = "HOÀN TẤT";
-            fill.className = "progress-bar-fill";
-        } else {
-            badge.className = "status-badge ready";
-            badge.textContent = "SẴN SÀNG";
-            fill.className = "progress-bar-fill";
+        if (badge) {
+            if (data.status_mode === "farming") {
+                badge.className = "status-badge farming";
+                badge.textContent = "ĐANG CÀY";
+                if (fill) fill.className = "progress-bar-fill farming";
+            } else if (data.status_mode === "done") {
+                badge.className = "status-badge done";
+                badge.textContent = "HOÀN TẤT";
+                if (fill) fill.className = "progress-bar-fill";
+            } else {
+                badge.className = "status-badge ready";
+                badge.textContent = "SẴN SÀNG";
+                if (fill) fill.className = "progress-bar-fill";
+            }
         }
     }
     lastWaitingState = data.waiting_ip_change;
 
     // 4. Thanh tiến độ
     const pPct = Math.round((data.progress || 0) * 100);
-    fill.style.width = pPct + "%";
-    document.getElementById("progressText").textContent = data.progress_text || "0%";
-    document.getElementById("progressPercent").textContent = pPct + "%";
+    if (fill) fill.style.width = pPct + "%";
+    const progTxt = document.getElementById("progressText");
+    if (progTxt) progTxt.textContent = data.progress_text || "0%";
+    const progPct = document.getElementById("progressPercent");
+    if (progPct) progPct.textContent = pPct + "%";
 
-    // 5. Danh sách tài khoản
+    // 5. Danh sách tài khoản (Hiển thị đầy đủ Điểm, Hôm nay, Streak, Hạng & Hạn mức)
     const accList = document.getElementById("accountsList");
-    if (data.accounts && Array.isArray(data.accounts) && data.accounts.length > 0) {
-        document.getElementById("accCountHeader").textContent = `${data.accounts.length} tài khoản`;
+    if (accList && data.accounts && Array.isArray(data.accounts) && data.accounts.length > 0) {
+        const accCountHeader = document.getElementById("accCountHeader");
+        if (accCountHeader) accCountHeader.textContent = `${data.accounts.length} tài khoản`;
         let html = "";
         data.accounts.forEach(acc => {
             const isFarming = String(acc.profile_id) === String(data.current_profile_id);
@@ -365,11 +469,17 @@ function renderUI(data) {
                 badgeClass = "badge-ready";
                 stText = "Sẵn sàng";
             }
+
+            const pts = (Number(acc.current_points) || 0).toLocaleString();
+            const gained = (acc.gained_today !== undefined && acc.gained_today !== null) ? acc.gained_today : 0;
+            const streakStr = acc.streak ? ` • Chuỗi: ${acc.streak}d` : "";
+            const noteStr = acc.note ? ` • ${acc.note}` : "";
+
             html += `
                 <div class="account-item ${rowClass}">
                     <div class="acc-info">
                         <div class="acc-name">${acc.profile_name || 'Profile'}</div>
-                        <div class="acc-meta">Điểm: ${(Number(acc.current_points)||0).toLocaleString()} pts • Hôm nay: +${acc.gained_today||0}</div>
+                        <div class="acc-meta">Điểm: ${pts} pts • Hôm nay: +${gained}${streakStr}${noteStr}</div>
                     </div>
                     <span class="badge-pill ${badgeClass}">${stText}</span>
                 </div>
@@ -380,7 +490,7 @@ function renderUI(data) {
 
     // 6. Console Log terminal
     const logBox = document.getElementById("logsTerminal");
-    if (data.logs) {
+    if (logBox && data.logs) {
         const wasBottom = (logBox.scrollHeight - logBox.clientHeight) <= (logBox.scrollTop + 50);
         logBox.textContent = data.logs;
         if (wasBottom) {
@@ -389,32 +499,40 @@ function renderUI(data) {
     }
 }
 
-// Kiểm tra nhịp tim định kỳ: Nếu quá 15 giây không có dữ liệu mới thì tự động về Offline
+// Kiểm tra nhịp tim định kỳ: Nếu quá 20 giây không có tín hiệu mới thì tự động về Offline
 setInterval(() => {
-    if (getApiBaseUrl() === null) {
-        const nowSec = Date.now() / 1000;
-        if (lastHeartbeatTime > 0 && (nowSec - lastHeartbeatTime > 15)) {
-            setPcOfflineUI("Mất kết nối với máy tính (quá 15 giây không có tín hiệu).");
-        }
+    const nowSec = Date.now() / 1000;
+    if (lastHeartbeatTime > 0 && (nowSec - lastHeartbeatTime > 20)) {
+        setPcOfflineUI("Mất kết nối với máy tính (quá 20 giây không có tín hiệu mới).");
     }
-}, 2500);
+}, 3000);
 
 // Gửi hành động điều khiển về Backend (hỗ trợ cả Local Wi-Fi lẫn Cloud Relay từ xa)
 async function postAction(actionName) {
     const baseUrl = getApiBaseUrl();
+    let localSuccess = false;
     if (baseUrl) {
-        const endpoint = (baseUrl ? baseUrl : "") + "/api/action";
+        const endpoint = baseUrl + "/api/action";
         try {
-            await fetch(endpoint, {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
+            const res = await fetch(endpoint, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ action: actionName })
+                body: JSON.stringify({ action: actionName }),
+                signal: controller.signal
             });
-            fetchStatusLocal();
+            clearTimeout(timeoutId);
+            if (res.ok) {
+                localSuccess = true;
+                fetchStatusLocal();
+            }
         } catch (err) {
-            console.error("Lỗi gửi action local:", err);
+            console.warn("Lỗi gửi action local, chuyển sang cloud fallback:", err);
         }
-    } else {
+    }
+
+    if (!localSuccess) {
         // Gửi lệnh qua Cloud Relay topic tới PC
         const cmdTopic = localStorage.getItem("msr_cmd_topic") || DEFAULT_CMD_TOPIC;
         try {
@@ -426,7 +544,7 @@ async function postAction(actionName) {
                     timestamp: Date.now() / 1000
                 })
             });
-            console.log("Đã phát lệnh từ xa:", actionName, res.status);
+            console.log("Đã phát lệnh từ xa qua Cloud:", actionName, res.status);
             if (navigator.vibrate) navigator.vibrate(60);
         } catch (err) {
             console.error("Lỗi gửi action cloud:", err);
@@ -438,17 +556,18 @@ async function postAction(actionName) {
 function openSettingsModal() {
     const modal = document.getElementById("settingsModal");
     const input = document.getElementById("bridgeUrlInput");
-    input.value = localStorage.getItem("msr_bridge_url") || "";
-    modal.classList.add("open");
+    if (input) input.value = localStorage.getItem("msr_bridge_url") || "";
+    if (modal) modal.classList.add("open");
 }
 
 function closeSettingsModal() {
-    document.getElementById("settingsModal").classList.remove("open");
+    const modal = document.getElementById("settingsModal");
+    if (modal) modal.classList.remove("open");
 }
 
 function saveSettings() {
     const val = document.getElementById("bridgeUrlInput").value.trim();
-    if (val) {
+    if (val && !val.includes("example.trycloudflare.com")) {
         localStorage.setItem("msr_bridge_url", val);
     } else {
         localStorage.removeItem("msr_bridge_url");
@@ -459,23 +578,39 @@ function saveSettings() {
 
 function resetSettings() {
     localStorage.removeItem("msr_bridge_url");
-    document.getElementById("bridgeUrlInput").value = "";
+    const input = document.getElementById("bridgeUrlInput");
+    if (input) input.value = "";
     closeSettingsModal();
     startSync();
 }
 
-// Bắt đầu luồng đồng bộ thông minh
-function startSync() {
+// Bắt đầu luồng đồng bộ: Auto-Bridge GitHub + Local Polling + Cloud Relay
+async function startSync() {
+    // 1. Tự động tìm và cập nhật Bridge mới nhất từ GitHub API
+    await autoFetchBridgeFromGitHub();
+
+    // 2. Kích hoạt Cloud Relay thời gian thực (SSE) dự phòng
+    initCloudRelay();
+    setInterval(pollLatestCloudMessage, 4000);
+
+    // 3. Kích hoạt Local Polling nếu có cấu hình mạng nội bộ / Bridge khả dụng
+    if (localPollingTimer) {
+        clearInterval(localPollingTimer);
+        localPollingTimer = null;
+    }
     const baseUrl = getApiBaseUrl();
     if (baseUrl !== null) {
-        // Có địa chỉ nội bộ Wi-Fi hoặc bridge tùy chỉnh
         fetchStatusLocal();
-        setInterval(fetchStatusLocal, 1500);
+        localPollingTimer = setInterval(fetchStatusLocal, 1500);
     } else {
-        // Tự động kết nối Cloud Relay API
-        initCloudRelay();
-        // Polling dự phòng mỗi 4 giây
-        setInterval(pollLatestCloudMessage, 4000);
+        // Nếu chưa tìm thấy Bridge, thử dò lại sau 3s
+        setTimeout(async () => {
+            const retryUrl = await autoFetchBridgeFromGitHub();
+            if (retryUrl && !localPollingTimer) {
+                fetchStatusLocal();
+                localPollingTimer = setInterval(fetchStatusLocal, 1500);
+            }
+        }, 3000);
     }
 }
 
