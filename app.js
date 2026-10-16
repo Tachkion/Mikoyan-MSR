@@ -22,6 +22,12 @@ async function autoFetchBridgeFromGitHub() {
             const data = await res.json();
             if (data.content) {
                 const decoded = JSON.parse(atob(data.content.replace(/\s/g, "")));
+                if (decoded.online === false || decoded.bridge_url === "") {
+                    console.log("[Auto-Bridge] GitHub xác nhận Tool đang tắt (Offline).");
+                    localStorage.removeItem("msr_bridge_url");
+                    setPcOfflineUI("Tool trên PC đã tắt.");
+                    return null;
+                }
                 if (decoded.bridge_url && decoded.bridge_url.startsWith("https://")) {
                     const currentSaved = localStorage.getItem("msr_bridge_url");
                     if (currentSaved !== decoded.bridge_url) {
@@ -169,23 +175,31 @@ function playChime() {
 function initCloudRelay() {
     const topic = localStorage.getItem("msr_relay_topic") || DEFAULT_RELAY_TOPIC;
 
-    // 1. Mở kết nối SSE thời gian thực (Server-Sent Events)
+    // 1. Mở kết nối SSE thời gian thực với ?since=now để KHÔNG replay tin cũ từ quá khứ
     if (eventSource) {
         try { eventSource.close(); } catch (e) {}
     }
     try {
-        eventSource = new EventSource(`https://ntfy.sh/${topic}/sse`);
+        eventSource = new EventSource(`https://ntfy.sh/${topic}/sse?since=now`);
         eventSource.onopen = () => {
             console.log("[Cloud Relay] Đã mở luồng SSE thời gian thực:", topic);
             const latency = document.getElementById("latencyText");
-            if (latency) latency.textContent = "Cloud Live (Đang kết nối PC...)";
+            if (latency) latency.textContent = "Cloud Live";
         };
         eventSource.onmessage = (e) => {
             try {
                 const ev = JSON.parse(e.data);
                 if (ev.event === "message" && ev.message) {
                     const data = JSON.parse(ev.message);
-                    renderUI(data, "sse");
+                    const nowSec = Date.now() / 1000;
+                    const ageSec = nowSec - (Number(data.timestamp) || 0);
+                    if (data.status_mode === "offline" || data.is_online === false) {
+                        setPcOfflineUI("Tool trên PC đã tắt.");
+                        return;
+                    }
+                    if (ageSec <= 10 && ageSec >= -15) {
+                        renderUI(data, "sse");
+                    }
                 }
             } catch (err) {}
         };
@@ -201,6 +215,7 @@ function initCloudRelay() {
 }
 
 function setPcOfflineUI(reason) {
+    lastHeartbeatTime = 0;
     const pcPill = document.getElementById("pcStatusPill");
     const pcText = document.getElementById("pcStatusText");
     const badge = document.getElementById("statusBadge");
@@ -238,7 +253,7 @@ function setPcOfflineUI(reason) {
 
 function pollLatestCloudMessage() {
     const topic = localStorage.getItem("msr_relay_topic") || DEFAULT_RELAY_TOPIC;
-    fetch(`https://ntfy.sh/${topic}/json?poll=1&limit=5`)
+    fetch(`https://ntfy.sh/${topic}/json?poll=1&limit=3`)
         .then(res => res.text())
         .then(text => {
             const lines = text.trim().split("\n").filter(l => l.trim());
@@ -254,14 +269,26 @@ function pollLatestCloudMessage() {
                     }
                 } catch (e) {}
             }
-            if (latestData) {
-                renderUI(latestData, "cloud_poll");
-            } else if (lastHeartbeatTime === 0) {
-                setPcOfflineUI();
+            const nowSec = Date.now() / 1000;
+            if (latestData && latestData.timestamp) {
+                const ageSec = nowSec - Number(latestData.timestamp);
+                if (latestData.status_mode === "offline" || latestData.is_online === false) {
+                    setPcOfflineUI("Tool trên PC đã tắt.");
+                    return;
+                }
+                // Chỉ nhận dữ liệu ntfy nếu phát trong vòng 10 giây trở lại
+                if (ageSec <= 10 && ageSec >= -15) {
+                    renderUI(latestData, "cloud_poll");
+                    return;
+                }
+            }
+            // Nếu dữ liệu ntfy đã cũ hơn 10s hoặc không có, và kết nối trực tiếp thất bại -> Đưa về Offline ngay
+            if (localFailCount > 0 || lastHeartbeatTime === 0 || (nowSec - lastHeartbeatTime > 8)) {
+                setPcOfflineUI("Chưa kết nối PC");
             }
         })
         .catch(() => {
-            if (lastHeartbeatTime === 0) setPcOfflineUI();
+            if (localFailCount > 0 || lastHeartbeatTime === 0) setPcOfflineUI();
         });
 }
 
@@ -301,6 +328,7 @@ async function fetchStatusLocal() {
 // Xử lý khi mất kết nối tới Backend (ví dụ khi modem đang reboot hoặc PC tắt)
 function handleConnectionError() {
     localFailCount++;
+    const nowSec = Date.now() / 1000;
     if (lastWaitingState) {
         const pcPill = document.getElementById("pcStatusPill");
         const pcText = document.getElementById("pcStatusText");
@@ -309,8 +337,13 @@ function handleConnectionError() {
         if (pcText) pcText.textContent = "Modem rebooting...";
         if (latencyText) latencyText.textContent = "Đang khởi động lại modem...";
     } else {
+        // Nếu kết nối trực tiếp thất bại và quá 6 giây không có heartbeat tươi -> Offline ngay!
+        if (lastHeartbeatTime === 0 || (nowSec - lastHeartbeatTime > 6)) {
+            setPcOfflineUI("Không thể kết nối tới PC (Tool đã tắt).");
+        }
+
         // Tự động kiểm tra lại GitHub API xem Tool có cập nhật URL mới không
-        if (localFailCount >= 2) {
+        if (localFailCount >= 3) {
             autoFetchBridgeFromGitHub().then(newUrl => {
                 if (newUrl) {
                     localFailCount = 0;
@@ -328,9 +361,6 @@ function handleConnectionError() {
                 localStorage.removeItem("msr_bridge_url");
             }
         }
-        if (lastHeartbeatTime === 0 || (Date.now() / 1000 - lastHeartbeatTime > 15)) {
-            setPcOfflineUI();
-        }
     }
 }
 
@@ -339,11 +369,19 @@ function renderUI(data, source = "cloud") {
     if (!data) return;
 
     const nowSec = Date.now() / 1000;
-    // SSE & Local fetch là sự kiện trực tiếp thời gian thực, luôn hợp lệ
-    // Với poll từ cloud buffer, chấp nhận dữ liệu trong vòng 300 giây để phòng lệch đồng hồ hệ thống
+    const msgTs = Number(data.timestamp) || 0;
+    const ageSec = nowSec - msgTs;
+
+    // Nếu Tool phát tín hiệu offline -> lập tức báo Offline
+    if (data.status_mode === "offline" || data.is_online === false) {
+        setPcOfflineUI("Tool trên PC đã tắt.");
+        return;
+    }
+
     let isFresh = true;
-    if (source === "cloud_poll" && data.timestamp) {
-        if (Math.abs(nowSec - data.timestamp) > 300) {
+    if (source !== "local" && msgTs > 0) {
+        // Dữ liệu từ ntfy hoặc sse chỉ hợp lệ nếu gửi trong vòng 10 giây
+        if (ageSec > 10 || ageSec < -15) {
             isFresh = false;
         }
     }
@@ -358,7 +396,7 @@ function renderUI(data, source = "cloud") {
         if (pcPill) pcPill.className = "pc-pill online";
         if (pcText) pcText.textContent = "PC Online";
     } else {
-        setPcOfflineUI("Dữ liệu cũ đã hết hạn. Chờ máy tính phát tín hiệu mới...");
+        setPcOfflineUI("Dữ liệu cũ đã hết hạn (Tool PC không phản hồi).");
         return;
     }
 
@@ -499,13 +537,13 @@ function renderUI(data, source = "cloud") {
     }
 }
 
-// Kiểm tra nhịp tim định kỳ: Nếu quá 20 giây không có tín hiệu mới thì tự động về Offline
+// Kiểm tra nhịp tim định kỳ: Nếu quá 8 giây không có tín hiệu mới từ PC -> Chuyển về Offline ngay lập tức
 setInterval(() => {
     const nowSec = Date.now() / 1000;
-    if (lastHeartbeatTime > 0 && (nowSec - lastHeartbeatTime > 20)) {
-        setPcOfflineUI("Mất kết nối với máy tính (quá 20 giây không có tín hiệu mới).");
+    if (lastHeartbeatTime > 0 && (nowSec - lastHeartbeatTime > 8)) {
+        setPcOfflineUI("Đã mất kết nối (Tool trên PC đã tắt).");
     }
-}, 3000);
+}, 2000);
 
 // Gửi hành động điều khiển về Backend (hỗ trợ cả Local Wi-Fi lẫn Cloud Relay từ xa)
 async function postAction(actionName) {
