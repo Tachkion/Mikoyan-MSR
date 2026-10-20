@@ -1,6 +1,6 @@
 {
-  "bridge_url": "",
-  "online": false,
-  "updated_at": 1792461813.9347124,
-  "time_str": "2026-10-20 09:03:33"
+  "bridge_url": "https://counting-thing-cam-connections.trycloudflare.com",
+  "online": true,
+  "updated_at": 1792469471.7668495,
+  "time_str": "2026-10-20 11:11:11"
 }
